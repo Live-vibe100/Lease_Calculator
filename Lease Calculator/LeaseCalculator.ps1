@@ -1,16 +1,57 @@
+<#
+.SYNOPSIS
+    Lease Calculator - a small Windows Forms app for checking car lease deals.
+.DESCRIPTION
+    Plug in the numbers from a dealer worksheet and see the monthly payment breakdown.
+    The math lives in LeaseMath.ps1 (same folder) so it can be tested on its own.
+#>
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# =============================
+# STARTUP
+# =============================
+
+# The launcher hides the console, so a startup problem would otherwise just
+# look like "nothing happened". Show it in a message box instead.
+try {
+    $mathFile = Join-Path $PSScriptRoot 'LeaseMath.ps1'
+    if (-not (Test-Path -LiteralPath $mathFile)) {
+        throw "LeaseMath.ps1 is missing. Keep it in the same folder as LeaseCalculator.ps1."
+    }
+    . $mathFile
+}
+catch {
+    [void][System.Windows.Forms.MessageBox]::Show("Lease Calculator couldn't start:`n`n$($_.Exception.Message)", "Lease Calculator", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    exit 1
+}
+
+# Tell Windows we handle display scaling (125%, 150%...) ourselves so text stays
+# sharp. Must happen before the window exists. If it fails, Windows stretches
+# the window instead - blurrier, but everything still works.
+try {
+    Add-Type -Namespace LeaseCalculator -Name NativeMethods -ErrorAction Stop -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+    [void][LeaseCalculator.NativeMethods]::SetProcessDPIAware()
+}
+catch {
+    Write-Warning "Display scaling support unavailable, window may look blurry: $($_.Exception.Message)"
+}
 
 # =============================
 # FORM SETUP
 # =============================
 
 $form = New-Object System.Windows.Forms.Form
+$form.SuspendLayout()
+# Layout below is in pixels at 100% scaling; WinForms scales it up for other settings
+$form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
+$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 $form.Text = "Lease Calculator"
-$form.Size = New-Object System.Drawing.Size(1400, 920)
-$form.StartPosition = "CenterScreen"
+$form.ClientSize = New-Object System.Drawing.Size(1130, 610)
+$form.StartPosition = "Manual"    # centered on Load, after sizing to fit the screen
 $form.FormBorderStyle = 'FixedDialog'
-$form.AutoScroll = $false
+$form.AutoScroll = $true
 $form.MaximizeBox = $false
 $form.BackColor = [System.Drawing.Color]::White
 
@@ -20,67 +61,82 @@ $form.BackColor = [System.Drawing.Color]::White
 
 $colorValid = [System.Drawing.Color]::White
 $colorInvalid = [System.Drawing.Color]::FromArgb(255, 230, 230)
-$borderInvalid = [System.Drawing.Color]::FromArgb(220, 60, 60)
 
 # =============================
-# TRACKING COLLECTIONS
+# TRACKING
 # =============================
 
 $script:allTextBoxes = @()
-$script:syncingAPR = $false
-$script:syncingMF = $false
-$script:syncingResVal = $false
-$script:syncingResPct = $false
+# True while the app itself is changing a field's text, so the sync handlers
+# don't mistake it for the user typing
+$script:syncing = $false
+# Which field of each pair the user last edited. That one is used for the math;
+# the other is just filled in to match. $null = nothing entered yet.
+$script:residualSource = $null   # 'ResidualValue' or 'ResidualPercent'
+$script:rateSource = $null       # 'MoneyFactor' or 'APR'
+$resultsPlaceholder = "Results will appear here"
 
 # =============================
 # HELPER FUNCTIONS
 # =============================
 
 function Add-LabeledField {
+    <#
+    .SYNOPSIS
+        Adds a label, text box (with gray placeholder text), and description to the form.
+    .OUTPUTS
+        The TextBox. Its Name is used to look up its validation rule.
+    #>
     param(
+        [string]$Name,
         [string]$Label,
         [string]$Description,
         [string]$Placeholder,
+        [int]$X,
         [int]$Y
     )
 
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = $Label
-    $lbl.Location = New-Object System.Drawing.Point(20, $Y)
-    $lbl.Size = New-Object System.Drawing.Size(220, 20)
+    $lbl.Location = New-Object System.Drawing.Point($X, $Y)
+    $lbl.Size = New-Object System.Drawing.Size(225, 20)
     $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($lbl)
 
     $txt = New-Object System.Windows.Forms.TextBox
-    $txt.Location = New-Object System.Drawing.Point(460, $Y)
-    $txt.Size = New-Object System.Drawing.Size(170, 22)
+    $txt.Name = $Name
+    $txt.Location = New-Object System.Drawing.Point(($X + 230), ($Y - 2))
+    $txt.Size = New-Object System.Drawing.Size(140, 22)
     $txt.Tag = $Placeholder
     $txt.Text = $Placeholder
     $txt.ForeColor = [System.Drawing.Color]::Gray
     $form.Controls.Add($txt)
 
-    # Placeholder behavior - focus
+    # Placeholder behavior - focus (not the user typing, so flagged as syncing)
     $txt.Add_GotFocus({
         if ($this.Text -eq $this.Tag) {
+            $script:syncing = $true
             $this.Text = ""
             $this.ForeColor = [System.Drawing.Color]::Black
+            $script:syncing = $false
         }
     })
 
-    # Placeholder behavior - leave
+    # Placeholder behavior - leave, then check the field
     $txt.Add_LostFocus({
-        if ($this.Text -eq "" -or $this.Text -eq $this.Tag) {
+        if ($this.Text.Trim() -eq "") {
+            $script:syncing = $true
             $this.Text = $this.Tag
             $this.ForeColor = [System.Drawing.Color]::Gray
-            $this.BackColor = $colorValid
+            $script:syncing = $false
         }
+        Test-Field -Field $this | Out-Null
     })
 
     $desc = New-Object System.Windows.Forms.Label
     $desc.Text = $Description
-    $desc.Location = New-Object System.Drawing.Point(20, ($Y + 22))
-    $desc.Size = New-Object System.Drawing.Size(380, 42)
-    $desc.MaximumSize = New-Object System.Drawing.Size(380, 0)
+    $desc.Location = New-Object System.Drawing.Point($X, ($Y + 24))
+    $desc.MaximumSize = New-Object System.Drawing.Size(370, 0)
     $desc.AutoSize = $true
     $desc.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
     $desc.ForeColor = [System.Drawing.Color]::DarkSlateGray
@@ -90,221 +146,275 @@ function Add-LabeledField {
     return $txt
 }
 
-function Get-FieldValue {
+function Test-FieldBlank {
+    <# .SYNOPSIS True if the field is empty or still showing its placeholder. #>
     param([System.Windows.Forms.TextBox]$Field)
     $raw = $Field.Text.Trim()
-    if ($raw -eq "" -or $raw -eq $Field.Tag) { return $null }
-    # Strip $, commas, % signs
-    $raw = $raw -replace '[\$,%]', ''
-    $raw = $raw.Trim()
-    $val = 0.0
-    if ([double]::TryParse($raw, [ref]$val)) { return $val }
-    return $null
+    return ($raw -eq "" -or $raw -eq $Field.Tag)
 }
 
-function Validate-PositiveNumber {
-    param([System.Windows.Forms.TextBox]$Field, [bool]$Required = $true)
-    $val = Get-FieldValue $Field
-    if ($null -eq $val) {
-        if ($Required) {
-            $Field.BackColor = $colorInvalid
-            return $false
-        }
-        return $true
-    }
-    if ($val -lt 0) {
-        $Field.BackColor = $colorInvalid
-        return $false
-    }
-    $Field.BackColor = $colorValid
-    return $true
-}
-
-function Validate-NonNegativeNumber {
+function Get-FieldValue {
+    <# .SYNOPSIS The field's number, or $null if it's blank or not a number. #>
     param([System.Windows.Forms.TextBox]$Field)
-    $val = Get-FieldValue $Field
-    if ($null -eq $val) { return $true }
-    if ($val -lt 0) {
-        $Field.BackColor = $colorInvalid
-        return $false
-    }
-    $Field.BackColor = $colorValid
-    return $true
+    if (Test-FieldBlank $Field) { return $null }
+    return ConvertTo-LeaseNumber $Field.Text
 }
 
-function Validate-Range {
-    param([System.Windows.Forms.TextBox]$Field, [double]$Min, [double]$Max, [bool]$Required = $true)
-    $val = Get-FieldValue $Field
-    if ($null -eq $val) {
-        if ($Required) {
-            $Field.BackColor = $colorInvalid
-            return $false
+function Set-FieldText {
+    <#
+    .SYNOPSIS
+        Fills in a field from code rather than the user. Blank text puts the placeholder back.
+    #>
+    param([System.Windows.Forms.TextBox]$Field, [string]$Text)
+    $script:syncing = $true
+    try {
+        if ([string]::IsNullOrEmpty($Text)) {
+            $Field.Text = $Field.Tag
+            $Field.ForeColor = [System.Drawing.Color]::Gray
         }
-        return $true
+        else {
+            $Field.Text = $Text
+            $Field.ForeColor = [System.Drawing.Color]::Black
+        }
+        $Field.BackColor = $colorValid
     }
-    if ($val -lt $Min -or $val -gt $Max) {
-        $Field.BackColor = $colorInvalid
-        return $false
+    finally {
+        $script:syncing = $false
     }
-    $Field.BackColor = $colorValid
-    return $true
+}
+
+function Test-Range {
+    <#
+    .SYNOPSIS
+        Checks a field holds a number in range and colors it red if not.
+        Text that isn't a number is always invalid, even in an optional field.
+    #>
+    param(
+        [System.Windows.Forms.TextBox]$Field,
+        [double]$Min = 0,
+        [double]$Max = [double]::MaxValue,
+        [bool]$Required = $true,
+        [switch]$WholeNumber
+    )
+    if (Test-FieldBlank $Field) {
+        $ok = -not $Required
+    }
+    else {
+        $ok = Test-LeaseValue -Value (Get-FieldValue $Field) -Min $Min -Max $Max -WholeNumber:$WholeNumber
+    }
+    $Field.BackColor = if ($ok) { $colorValid } else { $colorInvalid }
+    return $ok
+}
+
+# Rules for the stand-alone fields. Residual and rate pairs are handled separately below.
+$fieldRules = @{
+    MSRP         = @{ Min = 0.01; Max = [double]::MaxValue; Required = $true }
+    CapCost      = @{ Min = 0.01; Max = [double]::MaxValue; Required = $true }
+    Fees         = @{ Min = 0; Max = [double]::MaxValue; Required = $false }
+    CapReduction = @{ Min = 0; Max = [double]::MaxValue; Required = $false }
+    DownPayment  = @{ Min = 0; Max = [double]::MaxValue; Required = $false }
+    Term         = @{ Min = $LeaseLimits.TermMin; Max = $LeaseLimits.TermMax; Required = $true; WholeNumber = $true }
+    Tax          = @{ Min = 0; Max = $LeaseLimits.TaxMax; Required = $true }
+}
+
+function Test-PairFields {
+    <#
+    .SYNOPSIS
+        Checks a two-way pair (Residual $/% or Money Factor/APR). Only the field the user
+        edited is checked; the filled-in partner is cleared of any red.
+    .PARAMETER Required
+        When true (pressing Calculate), having neither field filled in is an error.
+    #>
+    param(
+        [string]$Source,
+        [System.Windows.Forms.TextBox]$First,
+        [System.Windows.Forms.TextBox]$Second,
+        [hashtable]$Limits,
+        [bool]$Required
+    )
+    # [string] turns $null into "", so check for both
+    if ([string]::IsNullOrEmpty($Source)) {
+        $First.BackColor = if ($Required) { $colorInvalid } else { $colorValid }
+        $Second.BackColor = $First.BackColor
+        return (-not $Required)
+    }
+    $sourceField = if ($First.Name -eq $Source) { $First } else { $Second }
+    $partner = if ($sourceField -eq $First) { $Second } else { $First }
+    $partner.BackColor = $colorValid
+    $limit = $Limits[$Source]
+    return Test-Range -Field $sourceField -Min $limit.Min -Max $limit.Max -Required $Required
+}
+
+function Test-Field {
+    <#
+    .SYNOPSIS
+        Checks one field against its rule and colors it.
+    .PARAMETER Calculating
+        True when Calculate was pressed - an empty pair then counts as an error.
+    #>
+    param([System.Windows.Forms.TextBox]$Field, [bool]$Calculating = $false)
+
+    if ($Field.Name -in 'ResidualValue', 'ResidualPercent') {
+        # A residual can't be worth more than the car's sticker price
+        $msrp = Get-FieldValue $txtMSRP
+        $maxValue = if ($null -ne $msrp -and $msrp -gt 0) { $msrp } else { [double]::MaxValue }
+        $limits = @{
+            ResidualValue   = @{ Min = 0; Max = $maxValue }
+            ResidualPercent = @{ Min = 0; Max = $LeaseLimits.ResidualPctMax }
+        }
+        return Test-PairFields -Source $script:residualSource -First $txtResidualValue -Second $txtResidualPercent -Limits $limits -Required $Calculating
+    }
+    if ($Field.Name -in 'MoneyFactor', 'APR') {
+        $limits = @{
+            MoneyFactor = @{ Min = 0; Max = $LeaseLimits.MoneyFactorMax }
+            APR         = @{ Min = 0; Max = $LeaseLimits.AprMax }
+        }
+        return Test-PairFields -Source $script:rateSource -First $txtMoneyFactor -Second $txtAPR -Limits $limits -Required $Calculating
+    }
+    $rule = $fieldRules[$Field.Name]
+    return Test-Range -Field $Field -Min $rule.Min -Max $rule.Max -Required $rule.Required -WholeNumber:([bool]$rule.WholeNumber)
 }
 
 # =============================
 # INPUT FIELDS
 # =============================
 
-$txtMSRP = Add-LabeledField `
+# Left column - the price of the car and what's knocked off it
+$colA = 20
+$colB = 410
+
+$txtMSRP = Add-LabeledField -Name "MSRP" -X $colA -Y 20 `
     -Label "MSRP" `
     -Description "Manufacturer's Suggested Retail Price. The original sticker price of the vehicle before discounts or incentives." `
-    -Placeholder "e.g. 35000.00" `
-    -Y 20
+    -Placeholder "e.g. 35000.00"
 
-$txtCapCost = Add-LabeledField `
+$txtCapCost = Add-LabeledField -Name "CapCost" -X $colA -Y 98 `
     -Label "Capitalized Cost" `
     -Description "The agreed-upon selling price of the vehicle before rebates or down payment reductions." `
-    -Placeholder "e.g. 33000.00" `
-    -Y 80
+    -Placeholder "e.g. 33000.00"
 
-$txtFees = Add-LabeledField `
+$txtFees = Add-LabeledField -Name "Fees" -X $colA -Y 176 `
     -Label "Fees" `
     -Description "Combined lease fees such as acquisition fee, documentation fee, etc." `
-    -Placeholder "e.g. 895.00" `
-    -Y 140
+    -Placeholder "e.g. 895.00"
 
-$txtCapReduction = Add-LabeledField `
+$txtCapReduction = Add-LabeledField -Name "CapReduction" -X $colA -Y 254 `
     -Label "Capitalized Cost Reduction" `
     -Description "Rebates, incentives, trade equity, manufacturer incentives, or cash used to reduce the lease amount financed." `
-    -Placeholder "e.g. 2000.00" `
-    -Y 200
+    -Placeholder "e.g. 2000.00"
 
-$txtDownPayment = Add-LabeledField `
+$txtDownPayment = Add-LabeledField -Name "DownPayment" -X $colA -Y 332 `
     -Label "Down Payment" `
     -Description "Cash paid upfront toward the lease. This lowers the monthly payment but increases upfront cost." `
-    -Placeholder "e.g. 1500.00" `
-    -Y 270
+    -Placeholder "e.g. 1500.00"
 
-$txtResidualValue = Add-LabeledField `
+# Right column - residual, rate, term, and tax
+$txtResidualValue = Add-LabeledField -Name "ResidualValue" -X $colB -Y 20 `
     -Label "Residual Value ($)" `
-    -Description "Estimated vehicle value at the end of the lease term. Usually provided by the leasing company." `
-    -Placeholder "e.g. 22750.00" `
-    -Y 340
+    -Description "Estimated vehicle value at the end of the lease term. Enter this OR Residual Percent - the other fills in." `
+    -Placeholder "e.g. 22750.00"
 
-$txtResidualPercent = Add-LabeledField `
-    -Label "Residual Percent (Optional)" `
-    -Description "Optional percentage used to calculate residual value automatically from MSRP. Example: 65 for 65%." `
-    -Placeholder "e.g. 65" `
-    -Y 410
+$txtResidualPercent = Add-LabeledField -Name "ResidualPercent" -X $colB -Y 98 `
+    -Label "Residual Percent" `
+    -Description "Residual as a percentage of MSRP. Example: 65 for 65%. Enter this OR Residual Value - the other fills in." `
+    -Placeholder "e.g. 65"
 
-$txtMoneyFactor = Add-LabeledField `
+$txtMoneyFactor = Add-LabeledField -Name "MoneyFactor" -X $colB -Y 176 `
     -Label "Money Factor" `
-    -Description "Lease interest factor used to calculate finance charges. Example: 0.00180." `
-    -Placeholder "e.g. 0.00180" `
-    -Y 480
+    -Description "Lease interest factor used to calculate finance charges. Example: 0.00180. Enter this OR APR." `
+    -Placeholder "e.g. 0.00180"
 
-$txtAPR = Add-LabeledField `
-    -Label "APR (Optional)" `
-    -Description "Optional APR field used to automatically calculate money factor. Example: 4.32." `
-    -Placeholder "e.g. 4.32" `
-    -Y 550
+$txtAPR = Add-LabeledField -Name "APR" -X $colB -Y 254 `
+    -Label "APR" `
+    -Description "Annual percentage rate. Example: 4.32. Enter this OR Money Factor - the other fills in." `
+    -Placeholder "e.g. 4.32"
 
-$txtTerm = Add-LabeledField `
+$txtTerm = Add-LabeledField -Name "Term" -X $colB -Y 332 `
     -Label "Lease Term (Months)" `
-    -Description "Length of the lease in months. Typical terms are 24, 36, or 48 months." `
-    -Placeholder "e.g. 36" `
-    -Y 620
+    -Description "Length of the lease in whole months. Typical terms are 24, 36, or 48 months." `
+    -Placeholder "e.g. 36"
 
-$txtTax = Add-LabeledField `
+$txtTax = Add-LabeledField -Name "Tax" -X $colB -Y 410 `
     -Label "Sales Tax Rate" `
     -Description "Local sales tax rate applied to lease payments. Example: 5.9 for 5.9%." `
-    -Placeholder "e.g. 5.9" `
-    -Y 690
+    -Placeholder "e.g. 5.9"
 
 # =============================
-# INPUT VALIDATION ON LEAVE
+# AUTO-SYNC: RESIDUAL $ <-> RESIDUAL %
 # =============================
+# Whichever field you edit last is the one the math uses. The other is filled
+# in to match, and cleared if the one you edited is cleared.
 
-$txtMSRP.Add_LostFocus({ Validate-PositiveNumber -Field $txtMSRP -Required $true | Out-Null })
-$txtCapCost.Add_LostFocus({ Validate-PositiveNumber -Field $txtCapCost -Required $true | Out-Null })
-$txtFees.Add_LostFocus({ Validate-NonNegativeNumber -Field $txtFees | Out-Null })
-$txtCapReduction.Add_LostFocus({ Validate-NonNegativeNumber -Field $txtCapReduction | Out-Null })
-$txtDownPayment.Add_LostFocus({ Validate-NonNegativeNumber -Field $txtDownPayment | Out-Null })
-$txtResidualValue.Add_LostFocus({ Validate-PositiveNumber -Field $txtResidualValue -Required $false | Out-Null })
-$txtResidualPercent.Add_LostFocus({ Validate-Range -Field $txtResidualPercent -Min 0 -Max 100 -Required $false | Out-Null })
-$txtMoneyFactor.Add_LostFocus({ Validate-Range -Field $txtMoneyFactor -Min 0.00001 -Max 0.01 -Required $false | Out-Null })
-$txtAPR.Add_LostFocus({ Validate-Range -Field $txtAPR -Min 0 -Max 30 -Required $false | Out-Null })
-$txtTerm.Add_LostFocus({ Validate-Range -Field $txtTerm -Min 12 -Max 84 -Required $true | Out-Null })
-$txtTax.Add_LostFocus({ Validate-Range -Field $txtTax -Min 0 -Max 15 -Required $true | Out-Null })
-
-# =============================
-# AUTO-SYNC: APR <-> MONEY FACTOR
-# =============================
-
-$txtAPR.Add_TextChanged({
-    if ($script:syncingAPR) { return }
-    $val = Get-FieldValue $txtAPR
-    if ($null -ne $val -and $val -ge 0) {
-        $script:syncingMF = $true
-        $mf = $val / 2400
-        $txtMoneyFactor.Text = $mf.ToString("F5")
-        $txtMoneyFactor.ForeColor = [System.Drawing.Color]::Black
-        $script:syncingMF = $false
-    }
-})
-
-$txtMoneyFactor.Add_TextChanged({
-    if ($script:syncingMF) { return }
-    $val = Get-FieldValue $txtMoneyFactor
-    if ($null -ne $val -and $val -ge 0) {
-        $script:syncingAPR = $true
-        $apr = $val * 2400
-        $txtAPR.Text = $apr.ToString("F2")
-        $txtAPR.ForeColor = [System.Drawing.Color]::Black
-        $script:syncingAPR = $false
-    }
-})
-
-# =============================
-# AUTO-SYNC: RESIDUAL % <-> RESIDUAL $
-# =============================
-
-$txtResidualPercent.Add_TextChanged({
-    if ($script:syncingResPct) { return }
-    $pct = Get-FieldValue $txtResidualPercent
+function Sync-ResidualFields {
+    <# .SYNOPSIS Fills in the residual field the user didn't edit, from the one they did. #>
+    if ($null -eq $script:residualSource) { return }
     $msrp = Get-FieldValue $txtMSRP
-    if ($null -ne $pct -and $null -ne $msrp -and $msrp -gt 0) {
-        $script:syncingResVal = $true
-        $rv = $msrp * ($pct / 100)
-        $txtResidualValue.Text = $rv.ToString("F2")
-        $txtResidualValue.ForeColor = [System.Drawing.Color]::Black
-        $script:syncingResVal = $false
+    $haveMsrp = ($null -ne $msrp -and $msrp -gt 0)
+
+    if ($script:residualSource -eq 'ResidualValue') {
+        $rv = Get-FieldValue $txtResidualValue
+        $text = $null
+        if ($haveMsrp -and $null -ne $rv) { $text = (Get-ResidualPercent -Msrp $msrp -ResidualValue $rv).ToString("F2") }
+        Set-FieldText $txtResidualPercent $text
     }
-})
+    else {
+        $pct = Get-FieldValue $txtResidualPercent
+        $text = $null
+        if ($haveMsrp -and $null -ne $pct) { $text = (Get-ResidualValue -Msrp $msrp -Percent $pct).ToString("F2") }
+        Set-FieldText $txtResidualValue $text
+    }
+}
 
 $txtResidualValue.Add_TextChanged({
-    if ($script:syncingResVal) { return }
-    $rv = Get-FieldValue $txtResidualValue
-    $msrp = Get-FieldValue $txtMSRP
-    if ($null -ne $rv -and $null -ne $msrp -and $msrp -gt 0) {
-        $script:syncingResPct = $true
-        $pct = ($rv / $msrp) * 100
-        $txtResidualPercent.Text = $pct.ToString("F2")
-        $txtResidualPercent.ForeColor = [System.Drawing.Color]::Black
-        $script:syncingResPct = $false
-    }
+    if ($script:syncing) { return }
+    $script:residualSource = 'ResidualValue'
+    Sync-ResidualFields
 })
 
-# Also recalc residual $ when MSRP changes (if residual % is filled)
+$txtResidualPercent.Add_TextChanged({
+    if ($script:syncing) { return }
+    $script:residualSource = 'ResidualPercent'
+    Sync-ResidualFields
+})
+
+# MSRP changes update whichever residual field you DIDN'T type
 $txtMSRP.Add_TextChanged({
-    $pct = Get-FieldValue $txtResidualPercent
-    $msrp = Get-FieldValue $txtMSRP
-    if ($null -ne $pct -and $null -ne $msrp -and $msrp -gt 0) {
-        $script:syncingResVal = $true
-        $rv = $msrp * ($pct / 100)
-        $txtResidualValue.Text = $rv.ToString("F2")
-        $txtResidualValue.ForeColor = [System.Drawing.Color]::Black
-        $script:syncingResVal = $false
+    if ($script:syncing) { return }
+    Sync-ResidualFields
+})
+
+# =============================
+# AUTO-SYNC: MONEY FACTOR <-> APR
+# =============================
+
+function Sync-RateFields {
+    <# .SYNOPSIS Fills in the rate field the user didn't edit, from the one they did. #>
+    if ($null -eq $script:rateSource) { return }
+
+    if ($script:rateSource -eq 'APR') {
+        $apr = Get-FieldValue $txtAPR
+        $text = $null
+        if ($null -ne $apr) { $text = (ConvertTo-MoneyFactor -Apr $apr).ToString("F5") }
+        Set-FieldText $txtMoneyFactor $text
     }
+    else {
+        $mf = Get-FieldValue $txtMoneyFactor
+        $text = $null
+        if ($null -ne $mf) { $text = (ConvertTo-Apr -MoneyFactor $mf).ToString("F2") }
+        Set-FieldText $txtAPR $text
+    }
+}
+
+$txtMoneyFactor.Add_TextChanged({
+    if ($script:syncing) { return }
+    $script:rateSource = 'MoneyFactor'
+    Sync-RateFields
+})
+
+$txtAPR.Add_TextChanged({
+    if ($script:syncing) { return }
+    $script:rateSource = 'APR'
+    Sync-RateFields
 })
 
 # =============================
@@ -312,10 +422,10 @@ $txtMSRP.Add_TextChanged({
 # =============================
 
 $resultLabel = New-Object System.Windows.Forms.Label
-$resultLabel.Location = New-Object System.Drawing.Point(930, 40)
-$resultLabel.Size = New-Object System.Drawing.Size(380, 620)
+$resultLabel.Location = New-Object System.Drawing.Point(810, 20)
+$resultLabel.Size = New-Object System.Drawing.Size(300, 470)
 $resultLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$resultLabel.Text = "Results will appear here"
+$resultLabel.Text = $resultsPlaceholder
 $form.Controls.Add($resultLabel)
 
 # =============================
@@ -324,7 +434,7 @@ $form.Controls.Add($resultLabel)
 
 $btnCalc = New-Object System.Windows.Forms.Button
 $btnCalc.Text = "Calculate Lease"
-$btnCalc.Location = New-Object System.Drawing.Point(930, 670)
+$btnCalc.Location = New-Object System.Drawing.Point(810, 500)
 $btnCalc.Size = New-Object System.Drawing.Size(220, 45)
 $btnCalc.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $btnCalc.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
@@ -339,7 +449,7 @@ $form.Controls.Add($btnCalc)
 
 $btnReset = New-Object System.Windows.Forms.Button
 $btnReset.Text = "Reset All"
-$btnReset.Location = New-Object System.Drawing.Point(930, 725)
+$btnReset.Location = New-Object System.Drawing.Point(810, 555)
 $btnReset.Size = New-Object System.Drawing.Size(105, 35)
 $btnReset.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $btnReset.BackColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
@@ -349,11 +459,11 @@ $form.Controls.Add($btnReset)
 
 $btnReset.Add_Click({
     foreach ($tb in $script:allTextBoxes) {
-        $tb.Text = $tb.Tag
-        $tb.ForeColor = [System.Drawing.Color]::Gray
-        $tb.BackColor = $colorValid
+        Set-FieldText $tb $null
     }
-    $resultLabel.Text = "Results will appear here"
+    $script:residualSource = $null
+    $script:rateSource = $null
+    $resultLabel.Text = $resultsPlaceholder
 })
 
 # =============================
@@ -362,7 +472,7 @@ $btnReset.Add_Click({
 
 $btnCopy = New-Object System.Windows.Forms.Button
 $btnCopy.Text = "Copy Results"
-$btnCopy.Location = New-Object System.Drawing.Point(1045, 725)
+$btnCopy.Location = New-Object System.Drawing.Point(925, 555)
 $btnCopy.Size = New-Object System.Drawing.Size(105, 35)
 $btnCopy.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $btnCopy.BackColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
@@ -371,7 +481,7 @@ $btnCopy.FlatAppearance.BorderSize = 0
 $form.Controls.Add($btnCopy)
 
 $btnCopy.Add_Click({
-    if ($resultLabel.Text -ne "Results will appear here") {
+    if ($resultLabel.Text -ne $resultsPlaceholder) {
         [System.Windows.Forms.Clipboard]::SetText($resultLabel.Text)
         [System.Windows.Forms.MessageBox]::Show("Results copied to clipboard.", "Copied", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
@@ -383,31 +493,10 @@ $btnCopy.Add_Click({
 
 $btnCalc.Add_Click({
 
-    # Run validation on all required fields
+    # Check every field - any red field blocks the calculation
     $valid = $true
-    if (-not (Validate-PositiveNumber -Field $txtMSRP -Required $true)) { $valid = $false }
-    if (-not (Validate-PositiveNumber -Field $txtCapCost -Required $true)) { $valid = $false }
-    if (-not (Validate-NonNegativeNumber -Field $txtFees)) { $valid = $false }
-    if (-not (Validate-NonNegativeNumber -Field $txtCapReduction)) { $valid = $false }
-    if (-not (Validate-NonNegativeNumber -Field $txtDownPayment)) { $valid = $false }
-    if (-not (Validate-Range -Field $txtTerm -Min 12 -Max 84 -Required $true)) { $valid = $false }
-    if (-not (Validate-Range -Field $txtTax -Min 0 -Max 15 -Required $true)) { $valid = $false }
-
-    # Validate one-or-the-other pairs
-    $mfVal = Get-FieldValue $txtMoneyFactor
-    $aprVal = Get-FieldValue $txtAPR
-    if ($null -eq $mfVal -and $null -eq $aprVal) {
-        $txtMoneyFactor.BackColor = $colorInvalid
-        $txtAPR.BackColor = $colorInvalid
-        $valid = $false
-    }
-
-    $rvVal = Get-FieldValue $txtResidualValue
-    $rpVal = Get-FieldValue $txtResidualPercent
-    if ($null -eq $rvVal -and $null -eq $rpVal) {
-        $txtResidualValue.BackColor = $colorInvalid
-        $txtResidualPercent.BackColor = $colorInvalid
-        $valid = $false
+    foreach ($tb in $script:allTextBoxes) {
+        if (-not (Test-Field -Field $tb -Calculating $true)) { $valid = $false }
     }
 
     if (-not $valid) {
@@ -418,71 +507,34 @@ $btnCalc.Add_Click({
     try {
 
         $msrp = Get-FieldValue $txtMSRP
-        $capCost = Get-FieldValue $txtCapCost
         $fees = Get-FieldValue $txtFees; if ($null -eq $fees) { $fees = 0 }
         $capReduction = Get-FieldValue $txtCapReduction; if ($null -eq $capReduction) { $capReduction = 0 }
         $downPayment = Get-FieldValue $txtDownPayment; if ($null -eq $downPayment) { $downPayment = 0 }
-        $term = Get-FieldValue $txtTerm
-        $taxRate = (Get-FieldValue $txtTax) / 100
 
-        # =============================
-        # MONEY FACTOR LOGIC
-        # =============================
-
-        $moneyFactor = Get-FieldValue $txtMoneyFactor
-        if ($null -eq $moneyFactor -or $moneyFactor -le 0) {
-            $apr = Get-FieldValue $txtAPR
-            $moneyFactor = $apr / 2400
-        }
-
-        # =============================
-        # RESIDUAL LOGIC
-        # =============================
-
-        if ($null -ne (Get-FieldValue $txtResidualPercent)) {
-            $residualPercent = (Get-FieldValue $txtResidualPercent) / 100
-            $residualValue = $msrp * $residualPercent
+        # Use exactly what the user typed, not the rounded number filled in beside it
+        if ($script:residualSource -eq 'ResidualPercent') {
+            $residualValue = Get-ResidualValue -Msrp $msrp -Percent (Get-FieldValue $txtResidualPercent)
         }
         else {
             $residualValue = Get-FieldValue $txtResidualValue
         }
 
-        # =============================
-        # NET CAPITALIZED COST
-        # =============================
+        if ($script:rateSource -eq 'APR') {
+            $moneyFactor = ConvertTo-MoneyFactor -Apr (Get-FieldValue $txtAPR)
+        }
+        else {
+            $moneyFactor = Get-FieldValue $txtMoneyFactor
+        }
 
-        $netCapCost = $capCost + $fees - $capReduction - $downPayment
-
-        # =============================
-        # DEPRECIATION
-        # =============================
-
-        $depreciation = ($netCapCost - $residualValue) / $term
-
-        # =============================
-        # FINANCE CHARGE
-        # =============================
-
-        $financeCharge = ($netCapCost + $residualValue) * $moneyFactor
-
-        # =============================
-        # BASE PAYMENT
-        # =============================
-
-        $basePayment = $depreciation + $financeCharge
-
-        # =============================
-        # FINAL PAYMENT
-        # =============================
-
-        $monthlyTax = $basePayment * $taxRate
-        $monthlyPayment = $basePayment + $monthlyTax
-
-        # =============================
-        # TOTAL LEASE COST
-        # =============================
-
-        $totalLeaseCost = ($monthlyPayment * $term) + $downPayment
+        $lease = Get-LeasePayment `
+            -CapCost (Get-FieldValue $txtCapCost) `
+            -Fees $fees `
+            -CapReduction $capReduction `
+            -DownPayment $downPayment `
+            -ResidualValue $residualValue `
+            -MoneyFactor $moneyFactor `
+            -Term (Get-FieldValue $txtTerm) `
+            -TaxRatePercent (Get-FieldValue $txtTax)
 
         # =============================
         # DISPLAY RESULTS
@@ -490,41 +542,60 @@ $btnCalc.Add_Click({
 
         $resultLabel.Text = @"
 Net Capitalized Cost:
-$($netCapCost.ToString('C'))
+$($lease.NetCapCost.ToString('C'))
 
 Residual Value:
-$($residualValue.ToString('C'))
+$($lease.ResidualValue.ToString('C'))
 
 Money Factor:
-$([math]::Round($moneyFactor, 5).ToString("F5"))
+$([math]::Round($lease.MoneyFactor, 5).ToString("F5"))
 
 Depreciation:
-$($depreciation.ToString('C')) / mo
+$($lease.Depreciation.ToString('C')) / mo
 
 Finance Charge:
-$($financeCharge.ToString('C')) / mo
+$($lease.FinanceCharge.ToString('C')) / mo
 
 Monthly Payment (before tax):
-$($basePayment.ToString('C'))
+$($lease.BasePayment.ToString('C'))
 
 Sales Tax / mo:
-$($monthlyTax.ToString('C'))
+$($lease.MonthlyTax.ToString('C'))
 
 Monthly Payment (with tax):
-$($monthlyPayment.ToString('C'))
+$($lease.MonthlyPayment.ToString('C'))
 
 Total Lease Cost:
-$($totalLeaseCost.ToString('C'))
+$($lease.TotalLeaseCost.ToString('C'))
 "@
 
     }
+    catch [System.ArgumentException] {
+        # The numbers are valid on their own but don't add up to a real lease
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Check Your Numbers", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+    }
     catch {
-        [System.Windows.Forms.MessageBox]::Show("Please verify all fields contain valid numbers.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        [System.Windows.Forms.MessageBox]::Show("Something went wrong calculating the lease:`n`n$($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
 })
 
 # =============================
 # RUN FORM
 # =============================
+
+# Never open bigger than the screen; scrollbars cover anything that doesn't fit.
+# Done on Load because that's after the window has been scaled for the display.
+$form.Add_Load({
+    $workArea = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea
+    $width = [math]::Min($this.Width, $workArea.Width)
+    $height = [math]::Min($this.Height, $workArea.Height)
+    $this.Size = New-Object System.Drawing.Size($width, $height)
+    $this.Location = New-Object System.Drawing.Point(
+        ($workArea.X + [int](($workArea.Width - $width) / 2)),
+        ($workArea.Y + [int](($workArea.Height - $height) / 2)))
+})
+
+$form.ResumeLayout($false)
+$form.PerformLayout()
 
 [void]$form.ShowDialog()

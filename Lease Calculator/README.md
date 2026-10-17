@@ -8,15 +8,16 @@ A Windows desktop lease calculator built in PowerShell using Windows Forms. Desi
 ## Features
 
 - **Full lease payment breakdown** — Net Capitalized Cost, depreciation, finance charge, monthly payment before/after tax, and total lease cost
-- **Auto-sync fields** — APR ↔ Money Factor and Residual % ↔ Residual $ automatically populate each other
-- **Input validation** — Fields highlight red on invalid input; strips `$`, `,`, and `%` characters automatically
+- **Auto-sync fields** — APR ↔ Money Factor and Residual % ↔ Residual $ fill each other in. Type whichever one your worksheet gives you; the math uses exactly what you typed, not the rounded number shown beside it
+- **Input validation** — Fields highlight red on invalid input, and Calculate won't run while anything is red. Typos like `1,5OO` (letter O) get caught instead of quietly counting as 0. Strips `$`, `,`, and `%` characters automatically
+- **Sanity check** — If the numbers can't describe a real lease (like a down payment so big the net cap cost drops below the residual), you get a plain-English warning instead of a weird result
 - **Placeholder text** — Example values shown in each field so you know the expected format
 - **Copy to clipboard** — One click to copy your results
 - **Reset** — Clear all fields and start a new calculation
+- **Fits your screen** — Sized for a 1366×768 laptop, stays sharp at 125%/150% display scaling, and scrolls if it ever doesn't fit
 
 ## Screenshot
 
-<!-- Add a screenshot of the calculator here -->
 ![Lease Calculator](images/calculator_screenshot.png)
 
 ## Requirements
@@ -36,6 +37,8 @@ powershell -ExecutionPolicy Bypass -File .\LeaseCalculator.ps1
 
 > **Note:** If you get an execution policy error, the `-ExecutionPolicy Bypass` flag handles it. This only applies to the current session and doesn't change your system settings.
 
+> **Keep the files together:** `LeaseCalculator.ps1` (the window) needs `LeaseMath.ps1` (the math) in the same folder. If it's missing, the app tells you instead of silently not opening.
+
 ## Fields
 
 | Field | Required | Description |
@@ -45,14 +48,14 @@ powershell -ExecutionPolicy Bypass -File .\LeaseCalculator.ps1
 | Fees | No | Acquisition fee, doc fee, etc. (defaults to 0) |
 | Capitalized Cost Reduction | No | Rebates, incentives, trade equity (defaults to 0) |
 | Down Payment | No | Cash paid upfront (defaults to 0) |
-| Residual Value ($) | One required | Vehicle value at lease end |
-| Residual Percent | One required | Residual as a percentage of MSRP |
-| Money Factor | One required | Lease interest factor (e.g., 0.00180) |
-| APR | One required | Annual percentage rate (e.g., 4.32) |
-| Lease Term | Yes | Length in months (12–84) |
-| Sales Tax Rate | Yes | Local tax rate as a percentage (e.g., 5.9) |
+| Residual Value ($) | One required | Vehicle value at lease end (can't be more than MSRP) |
+| Residual Percent | One required | Residual as a percentage of MSRP (0–100) |
+| Money Factor | One required | Lease interest factor (e.g., 0.00180, max 0.0125) |
+| APR | One required | Annual percentage rate (e.g., 4.32, max 30) |
+| Lease Term | Yes | Length in whole months (12–84) |
+| Sales Tax Rate | Yes | Local tax rate as a percentage (0–15, e.g., 5.9) |
 
-"One required" means you need either field in the pair — the other auto-calculates.
+"One required" means you need either field in the pair — the other auto-calculates. Whichever one you edited last is the one the math uses. If you change MSRP later, the field you typed stays put and its partner updates.
 
 ## How the Math Works
 
@@ -77,6 +80,16 @@ APR = Money Factor × 2400
 - **Matching a dealer worksheet:** The "Capitalized Cost" field corresponds to the "Agreed Upon Value of Vehicle" on most lease worksheets. If the worksheet's Gross Capitalized Cost already includes fees, enter that as Cap Cost and leave Fees at 0.
 - **Small differences from worksheets:** The calculator uses the standard lease formula. Dealer worksheets may show $1–2/mo difference due to internal rounding of the rent charge. This is normal.
 - **Comparing deals:** Use the Total Lease Cost to compare different lease offers apples-to-apples, since a lower monthly payment with a higher down payment isn't always a better deal.
+
+## Testing the Math
+
+The math lives in `LeaseMath.ps1`, separate from the window, so it can be checked against known-good, hand-worked examples without clicking anything. Nothing to install:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tests\Test-LeaseMath.ps1
+```
+
+It prints PASS/FAIL for each check and exits with an error code if anything fails.
 
 ## License
 
