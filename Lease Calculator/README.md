@@ -81,15 +81,21 @@ APR = Money Factor × 2400
 - **Small differences from worksheets:** The calculator uses the standard lease formula. Dealer worksheets may show $1–2/mo difference due to internal rounding of the rent charge. This is normal.
 - **Comparing deals:** Use the Total Lease Cost to compare different lease offers apples-to-apples, since a lower monthly payment with a higher down payment isn't always a better deal.
 
-## Testing the Math
+## Testing
 
-The math lives in `LeaseMath.ps1`, separate from the window, so it can be checked against known-good, hand-worked examples without clicking anything. Nothing to install:
+Two test scripts, nothing to install. Each prints PASS/FAIL per check and exits with an error code if anything fails.
+
+**The math** (`LeaseMath.ps1`) is checked against known-good, hand-worked examples. Takes a second:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Tests\Test-LeaseMath.ps1
 ```
 
-It prints PASS/FAIL for each check and exits with an error code if anything fails.
+**The window** gets clicked through like a person would: it opens the app, types into fields, presses the buttons, and checks the results, auto-filled fields, red highlighting, and warning messages. Takes about 30 seconds and closes the app when it's done; best not to click around in the calculator while it runs. Add `-ScreenshotFolder <folder>` to save screenshots along the way.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tests\Test-LeaseWindow.ps1
+```
 
 ## License
 
