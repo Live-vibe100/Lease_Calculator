@@ -208,7 +208,14 @@ try {
     $shot = Get-WindowImage $w
     $width = $shot.Rect.Right - $shot.Rect.Left; $height = $shot.Rect.Bottom - $shot.Rect.Top
     $shot.Bmp.Dispose()
-    Assert-Check "Window fits a 1366x728 laptop screen" ($width -le 1366 -and $height -le 728) "${width}x${height}"
+    # Convert to its size at 100% scaling, so this check works at any display scaling
+    $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]$w.Current.NativeWindowHandle)
+    $scale = $g.DpiX / 96; $g.Dispose()
+    $baseWidth = [int]($width / $scale); $baseHeight = [int]($height / $scale)
+    Assert-Check "Window fits a 1366x728 laptop screen (at 100%)" ($baseWidth -le 1366 -and $baseHeight -le 728) "${baseWidth}x${baseHeight} at 100%, ${width}x${height} at $([int]($scale * 100))%"
+    Add-Type -AssemblyName System.Windows.Forms
+    $workArea = [System.Windows.Forms.Screen]::FromHandle([IntPtr]$w.Current.NativeWindowHandle).WorkingArea
+    Assert-Check "Window fits on this screen" ($width -le $workArea.Width -and $height -le $workArea.Height) "screen work area $($workArea.Width)x$($workArea.Height)"
     Assert-Check "Text boxes found in the expected order" ((Get-Field $w CapCost) -eq 'e.g. 33000.00' -and (Get-Field $w ResidualPercent) -eq 'e.g. 65' -and (Get-Field $w Tax) -eq 'e.g. 5.9')
     Save-Screenshot $w 'empty.png'
 
